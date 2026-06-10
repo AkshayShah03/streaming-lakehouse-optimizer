@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+artifacts/
+.pytest_cache/
+.ruff_cache/
+*.joblib

@@ -1,0 +1,11 @@
+# Core optimizer + tests (pure Python, no cluster needed)
+scikit-learn>=1.4
+numpy>=1.26
+joblib>=1.3
+pytest>=8.0
+
+# Live ingest / catalog (only needed to run the real stack)
+psycopg2-binary>=2.9      # telemetry generator -> Postgres
+pyiceberg[s3fs]>=0.7      # PyIcebergBackend maintenance ops
+apache-flink>=1.19        # PyFlink job submission
+apache-airflow>=2.9       # scheduled maintenance DAG

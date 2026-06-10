@@ -1,0 +1,94 @@
+# Full local lakehouse stack:
+#   Postgres (source) -> Debezium/Kafka Connect -> Kafka -> Flink -> Iceberg (MinIO/S3)
+#   Trino queries Iceberg; Airflow runs the guarded maintenance loop.
+#
+#   make up        # start everything
+#   make seed      # create source table
+#   make connect   # register Debezium connector
+#   make flink-submit
+#   make stream RPS=10000 SECONDS=120
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: lake
+      POSTGRES_PASSWORD: lake
+      POSTGRES_DB: fleet
+    command: ["postgres", "-c", "wal_level=logical"]   # required for CDC
+    ports: ["5432:5432"]
+    volumes:
+      - ./scripts/seed_postgres.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+
+  kafka:
+    image: bitnami/kafka:3.7
+    environment:
+      KAFKA_CFG_NODE_ID: "1"
+      KAFKA_CFG_PROCESS_ROLES: "controller,broker"
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_CFG_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    ports: ["9092:9092"]
+
+  connect:
+    image: debezium/connect:2.7
+    depends_on: [kafka, postgres]
+    environment:
+      BOOTSTRAP_SERVERS: "kafka:9092"
+      GROUP_ID: "1"
+      CONFIG_STORAGE_TOPIC: "connect_configs"
+      OFFSET_STORAGE_TOPIC: "connect_offsets"
+      STATUS_STORAGE_TOPIC: "connect_statuses"
+    ports: ["8083:8083"]
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+    ports: ["9000:9000", "9001:9001"]
+
+  iceberg-rest:
+    image: tabulario/iceberg-rest:1.6.0
+    depends_on: [minio]
+    environment:
+      CATALOG_WAREHOUSE: "s3://warehouse/"
+      CATALOG_IO__IMPL: "org.apache.iceberg.aws.s3.S3FileIO"
+      CATALOG_S3_ENDPOINT: "http://minio:9000"
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+    ports: ["8181:8181"]
+
+  flink-jobmanager:
+    build: ./infra/flink
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        state.backend: rocksdb
+        execution.checkpointing.interval: 30s
+        execution.checkpointing.mode: EXACTLY_ONCE
+    ports: ["8081:8081"]
+
+  flink-taskmanager:
+    build: ./infra/flink
+    command: taskmanager
+    depends_on: [flink-jobmanager]
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+    deploy:
+      replicas: 2
+
+  trino:
+    image: trinodb/trino:451
+    depends_on: [iceberg-rest, minio]
+    ports: ["8080:8080"]
+    volumes:
+      - ./infra/trino/catalog:/etc/trino/catalog:ro

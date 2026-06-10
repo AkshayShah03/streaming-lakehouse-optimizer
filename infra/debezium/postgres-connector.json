@@ -1,0 +1,23 @@
+{
+  "name": "fleet-telemetry-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "lake",
+    "database.password": "lake",
+    "database.dbname": "fleet",
+    "topic.prefix": "fleet",
+    "table.include.list": "public.telemetry",
+    "plugin.name": "pgoutput",
+    "slot.name": "fleet_slot",
+    "publication.autocreate.mode": "filtered",
+    "snapshot.mode": "initial",
+    "decimal.handling.mode": "double",
+    "tombstones.on.delete": "false",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter.schemas.enable": "false"
+  }
+}
