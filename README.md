@@ -28,6 +28,8 @@ Instead, this project learns a cost model: a function from (layout, workload) to
 
 ## Quickstart
 
+Live demo: https://streaming-lakehouse-optimizer-mugbi5ffxi8pkqwbwmoytg.streamlit.app
+
 ```bash
 pip install -r requirements.txt
 make test    # 50 tests, no cluster needed
