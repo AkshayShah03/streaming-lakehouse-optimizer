@@ -1,13 +1,11 @@
-"""Streaming Lakehouse Optimizer — interactive explainer + live demo."""
+"""Streaming Lakehouse Optimizer — interactive explainer and live demo."""
 import sys
 import json
-import math
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.express as px
 import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -16,17 +14,15 @@ from lakehouse.metrics.table_stats import SimulatedIcebergTable, Layout
 from lakehouse.optimizer.train import generate_dataset
 from lakehouse.optimizer.cost_model import CostModel, encode
 from lakehouse.optimizer.features import WorkloadFeatures
-from lakehouse.optimizer.layout_search import (
-    candidate_layouts, recommend, FILE_SIZES_MB, TRIGGERS, PARTITIONS,
-)
+from lakehouse.optimizer.layout_search import candidate_layouts, recommend
 from lakehouse.maintenance.iceberg_ops import SimBackend
 from lakehouse.maintenance.orchestrator import run_once
 from lakehouse.maintenance.regression_guard import GuardConfig, evaluate_promotion
-from lakehouse.maintenance.shadow_eval import shadow_evaluate, baseline_result
+from lakehouse.maintenance.shadow_eval import shadow_evaluate, baseline_result, EvalResult
 from lakehouse.maintenance.benchmark import measure_p95_latency
 
 # ---------------------------------------------------------------------------
-# Page config + CSS
+# Config — minimal overrides, let Streamlit do its job
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
@@ -38,62 +34,33 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-  .block-container { padding-top: 2rem; }
-  .metric-card {
-    background: #0f172a;
-    border: 1px solid #1e293b;
-    border-radius: 10px;
-    padding: 1.2rem 1.5rem;
-    text-align: center;
-  }
-  .metric-value-good  { font-size: 2.2rem; font-weight: 700; color: #4ade80; }
-  .metric-value-bad   { font-size: 2.2rem; font-weight: 700; color: #f87171; }
-  .metric-value-plain { font-size: 2.2rem; font-weight: 700; color: #e2e8f0; }
-  .metric-label       { font-size: 0.82rem; color: #94a3b8; margin-top: .3rem; }
-  .callout {
-    border-left: 4px solid #3b82f6;
-    background: #0f172a;
-    padding: 0.9rem 1.1rem;
-    border-radius: 0 8px 8px 0;
-    margin: 0.8rem 0;
-  }
-  .callout-warn {
-    border-left: 4px solid #f59e0b;
-    background: #0f172a;
-    padding: 0.9rem 1.1rem;
-    border-radius: 0 8px 8px 0;
-    margin: 0.8rem 0;
-  }
-  .step-badge {
-    display: inline-block;
-    background: #1d4ed8;
-    color: white;
-    border-radius: 50%;
-    width: 28px; height: 28px;
-    text-align: center;
-    line-height: 28px;
-    font-weight: bold;
-    margin-right: 8px;
-  }
-  .tag {
-    display: inline-block;
-    background: #1e3a5f;
-    color: #93c5fd;
-    border-radius: 4px;
-    padding: 2px 8px;
-    font-size: 0.78rem;
-    margin: 2px;
-  }
-  h1 { font-size: 2rem !important; }
+  #MainMenu, footer { visibility: hidden; }
+  .block-container { padding-top: 2rem; max-width: 1080px; }
+  .stTabs [data-baseweb="tab"] { font-size: 0.9rem; }
 </style>
 """, unsafe_allow_html=True)
 
+# Consistent chart palette used throughout
+C_BAD    = "#dc2626"   # red   — before / bad state
+C_GOOD   = "#16a34a"   # green — after / good state
+C_MODEL  = "#2563eb"   # blue  — model prediction
+C_SHADOW = "#0891b2"   # teal  — shadow measured
+C_GRAY   = "#9ca3af"   # gray  — neutral / secondary
+CHART_LAYOUT = dict(
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
+    font=dict(family="Inter, system-ui, sans-serif", size=12),
+    margin=dict(t=36, b=36, l=8, r=8),
+    xaxis=dict(showgrid=False, linecolor="#e5e7eb"),
+    yaxis=dict(gridcolor="#f3f4f6", linecolor="#e5e7eb"),
+)
+
 
 # ---------------------------------------------------------------------------
-# Cached training (expensive — ~4s once, then instant on re-runs)
+# Cached model training (~4 s once)
 # ---------------------------------------------------------------------------
 
-@st.cache_resource(show_spinner="Training cost model on 2,160 layout examples...")
+@st.cache_resource(show_spinner="Training cost model on 2,160 layout examples…")
 def _train_model():
     X, y_lat, y_cost, y_wamp = generate_dataset(n_workloads=60, seed=1)
     rng = np.random.RandomState(1)
@@ -102,198 +69,164 @@ def _train_model():
     tr, te = idx[:cut], idx[cut:]
     model = CostModel().fit(X[tr], y_lat[tr], y_cost[tr], y_wamp[tr])
     r2 = model.score(X[te], y_lat[te])
-    return model, r2, X, y_lat, y_cost, y_wamp
+    return model, r2
 
 
 # ---------------------------------------------------------------------------
-# Hero
+# Page header
 # ---------------------------------------------------------------------------
 
-st.markdown("## Streaming Lakehouse Optimizer")
-st.markdown(
-    "A real-time data pipeline that teaches itself how to stay fast — "
-    "using machine learning instead of a cron job."
+st.title("Streaming Lakehouse Optimizer")
+st.caption(
+    "A Flink → Kafka → Iceberg pipeline that replaces scheduled compaction "
+    "with a learned cost model and a safety-gated promotion loop."
 )
 st.markdown(
-    '<span class="tag">Apache Flink</span>'
-    '<span class="tag">Apache Iceberg</span>'
-    '<span class="tag">Apache Kafka</span>'
-    '<span class="tag">Debezium CDC</span>'
-    '<span class="tag">Gradient Boosting (GBM)</span>'
-    '<span class="tag">Python</span>'
-    '<span class="tag">Postgres</span>'
-    '<span class="tag">Trino</span>',
-    unsafe_allow_html=True,
+    "`Apache Flink` `Apache Iceberg` `Apache Kafka` `Debezium` "
+    "`Gradient Boosting` `PyIceberg` `Trino` `Airflow`"
 )
 st.divider()
 
-# ---------------------------------------------------------------------------
-# Tabs
-# ---------------------------------------------------------------------------
-
-tab1, tab2, tab3, tab4 = st.tabs([
-    "1  The Problem",
-    "2  Why Machine Learning?",
-    "3  Live Demo",
-    "4  The Safety Net",
+tab_problem, tab_solution, tab_demo, tab_guard = st.tabs([
+    "The Problem",
+    "Why Machine Learning",
+    "Live Demo",
+    "Safety Gate",
 ])
 
 
 # ===========================================================================
-# TAB 1 — THE PROBLEM
+# THE PROBLEM
 # ===========================================================================
 
-with tab1:
-    st.markdown("### Every 30 seconds, your pipeline creates one new file")
+with tab_problem:
+    st.subheader("A streaming pipeline creates one file every 30 seconds")
 
-    c1, c2 = st.columns([1, 1], gap="large")
+    left, right = st.columns([3, 4], gap="large")
 
-    with c1:
-        st.markdown("""
-A streaming pipeline like Flink writes data to disk at every **checkpoint** — a
-safety snapshot taken every 30 seconds. Each checkpoint produces one file.
-
-At 10,000 events per second that means:
-
-- **2 files per minute**
-- **2,880 files per day**
-- each file holds only ~1–2 MB of data
-
-The problem is that every file carries a fixed cost to open, regardless of how
-much data is inside. Think of it like getting 100 envelopes each containing one
-page, vs one envelope with all 100 pages. Reading 100 envelopes is slower even
-if the total content is the same.
-        """)
+    with left:
         st.markdown(
-            '<div class="callout">'
-            '<b>The technical term:</b> per-file open overhead — planning + metadata '
-            'read cost paid once per file, before a single row of actual data is read.'
-            '</div>',
-            unsafe_allow_html=True,
+            "Flink flushes data to Iceberg at every checkpoint interval. "
+            "At a 30-second interval and 10,000 events per second, that is **2,880 files per day** "
+            "before any compaction runs."
         )
+        st.markdown(
+            "Each file carries a fixed planning and open cost regardless of how much data it holds. "
+            "With 48 files averaging 1.3 MB each, the pipeline is paying that overhead 48 times "
+            "per query — before reading a single byte of actual data."
+        )
+        st.markdown("These are the measured numbers from this project's simulator:")
+        c1, c2 = st.columns(2)
+        c1.metric("Files on disk", "48", help="After one simulated day of ingest at 10k rows/sec")
+        c2.metric("Avg file size", "1.3 MB", help="Target is ~128–512 MB for efficient scans")
+        c1.metric("p95 scan latency", "211 ms", help="Per-file open overhead dominates")
+        c2.metric("After compaction", "83 ms", delta="-61%", delta_color="inverse",
+                  help="16 properly-sized files after the optimizer runs")
 
-    with c2:
-        # File accumulation over 48 checkpoints
-        checkpoints = list(range(1, 49))
+        with st.expander("What is per-file open overhead?"):
+            st.markdown(
+                "Every file in a columnar format like Parquet (which Iceberg uses under the hood) "
+                "requires the query engine to: open an S3 connection, read the file footer to get "
+                "column statistics and row group offsets, then decide which row groups to scan. "
+                "That sequence takes roughly 4 ms per file. With 48 files that is **192 ms before "
+                "reading a row of data**. With 16 files it is 64 ms."
+            )
+
+    with right:
+        # How scan time breaks down as file count grows
+        @st.cache_data
+        def _breakdown_df():
+            rows = []
+            for n in [4, 8, 16, 24, 32, 48]:
+                table = SimulatedIcebergTable(layout=Layout(64, 100_000, "day"))
+                for i in range(n):
+                    table.ingest_micro_batch(mb=1.3, rows=6500, partition=f"d{i % 4}")
+                overhead = len(table._files) * table.FILE_OPEN_MS
+                data_ms  = max(0.0, table.scan(0.1) - overhead)
+                rows.append({"Files": n, "Open overhead (ms)": overhead, "Data read (ms)": data_ms})
+            return pd.DataFrame(rows)
+
+        df = _breakdown_df()
         fig = go.Figure()
-        fig.add_bar(x=checkpoints, y=checkpoints, marker_color="#f87171",
-                    name="Files on disk")
+        fig.add_bar(x=df["Files"], y=df["Open overhead (ms)"],
+                    name="File open overhead", marker_color=C_BAD)
+        fig.add_bar(x=df["Files"], y=df["Data read (ms)"],
+                    name="Actual data read", marker_color=C_GRAY)
         fig.update_layout(
-            title="Files pile up with every checkpoint flush",
-            xaxis_title="Checkpoint number",
-            yaxis_title="Total files on disk",
-            plot_bgcolor="#0f172a", paper_bgcolor="#0f172a",
-            font_color="#e2e8f0",
-            margin=dict(t=40, b=40, l=40, r=20),
-            showlegend=False,
+            **CHART_LAYOUT,
+            barmode="stack",
+            title=dict(text="Where query time goes as file count grows", font_size=13),
+            xaxis_title="Files on disk",
+            yaxis_title="Simulated latency (ms)",
+            legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0),
         )
         st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
-    st.markdown("### Where query time actually goes")
+    st.subheader("Why a fixed schedule doesn't fix this")
 
-    # Build a real table with 48 small files and compute cost breakdown
-    @st.cache_data
-    def _latency_breakdown():
-        rows = []
-        for n_files in [4, 8, 16, 24, 32, 48]:
-            table = SimulatedIcebergTable(layout=Layout(64, 100000, "day"))
-            for i in range(n_files):
-                table.ingest_micro_batch(mb=1.3, rows=6500, partition=f"d{i % 4}")
-            total_ms = table.scan(selectivity=0.1)
-            overhead_ms = len(table._files) * table.FILE_OPEN_MS
-            data_ms = total_ms - overhead_ms
-            rows.append({"files": n_files, "File open overhead (ms)": overhead_ms,
-                         "Actual data read (ms)": max(0, data_ms)})
-        return pd.DataFrame(rows)
-
-    df_lat = _latency_breakdown()
-    fig2 = px.bar(
-        df_lat, x="files",
-        y=["File open overhead (ms)", "Actual data read (ms)"],
-        barmode="stack",
-        color_discrete_map={
-            "File open overhead (ms)": "#f87171",
-            "Actual data read (ms)": "#60a5fa",
-        },
-        labels={"files": "Number of files on disk", "value": "Latency (ms)"},
-        title="As file count grows, overhead swamps actual data read time",
+    a, b, c = st.columns(3)
+    a.info(
+        "**Ingest doubles.**  \nA new batch of vehicles comes online. "
+        "The cron job compacts on the same schedule it always did, so files pile up faster than it can keep up."
     )
-    fig2.update_layout(
-        plot_bgcolor="#0f172a", paper_bgcolor="#0f172a",
-        font_color="#e2e8f0", legend_title_text="",
-        margin=dict(t=40, b=40),
+    b.info(
+        "**Query pattern shifts.**  \nAnalysts start running narrow time-range lookups instead of full scans. "
+        "Hourly partitioning would prune 60% of files. The cron job doesn't change partition strategy."
     )
-    st.plotly_chart(fig2, use_container_width=True)
-
-    st.divider()
-    st.markdown("### Before vs after compaction — real numbers from this project")
-
-    m1, m2, m3, m4 = st.columns(4)
-    for col, val, label, cls in [
-        (m1, "48",     "Files before optimization",  "metric-value-bad"),
-        (m2, "16",     "Files after optimization",   "metric-value-good"),
-        (m3, "211 ms", "p95 query latency before",   "metric-value-bad"),
-        (m4, "83 ms",  "p95 query latency after",    "metric-value-good"),
-    ]:
-        col.markdown(
-            f'<div class="metric-card">'
-            f'<div class="{cls}">{val}</div>'
-            f'<div class="metric-label">{label}</div>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
+    c.info(
+        "**You find out months later.**  \nThere is no alert for \"compaction is no longer keeping up.\" "
+        "Someone benchmarks the table and the numbers are bad."
+    )
 
 
 # ===========================================================================
-# TAB 2 — WHY MACHINE LEARNING
+# WHY MACHINE LEARNING
 # ===========================================================================
 
-with tab2:
-    st.markdown("### Why not just run a compaction job on a schedule?")
+with tab_solution:
+    st.subheader("The search space has 36 candidates — the right answer depends on the workload")
 
-    c1, c2 = st.columns([1, 1], gap="large")
-    with c1:
-        st.markdown("""
-A scheduled cron job compacts files at fixed intervals — say, every hour.
-That works fine until anything changes:
+    st.markdown(
+        "There are 4 target file sizes, 3 compaction triggers, and 3 partition strategies. "
+        "Which combination is best depends on how the table is actually being used: "
+        "how fast data is arriving, how selective queries are, and whether queries filter by time or scan everything. "
+        "A cron job has no way to observe or reason about any of that."
+    )
 
-- Ingest doubles because a new fleet of vehicles comes online
-- Query patterns shift from full-table scans to narrow time-range lookups
-- A different partition strategy would cut scan time in half
+    model, r2 = _train_model()
 
-The cron job has no way to notice any of this. You find out months later when
-someone benchmarks the table and the numbers are bad.
+    col_text, col_chart = st.columns([2, 3], gap="large")
 
-**What we actually need** is a function that answers: *given what this table's
-queries look like right now, what file size, compaction frequency, and partition
-strategy produces the fastest scans at acceptable cost?*
-
-That answer depends on the current workload. A machine learning model can
-approximate it. A cron job cannot.
-        """)
+    with col_text:
+        st.markdown("**How the cost model is trained**")
         st.markdown(
-            '<div class="callout-warn">'
-            '<b>Why not train a model to output the optimal layout directly?</b><br>'
-            'There are no ground-truth "optimal layout" labels in production — you only '
-            'observe outcomes of layouts you actually ran. Instead, we train a '
-            '<em>cost model</em>: a function from (layout, workload) to '
-            '(predicted latency, cost, write amplification). Then we score every '
-            'candidate layout and pick the best one. This is the same structure '
-            'used in learned database query optimizers.'
-            '</div>',
-            unsafe_allow_html=True,
+            "The simulator drives a table to a steady state under every combination of "
+            "workload × layout — 60 workloads × 36 candidates = 2,160 training examples. "
+            "For each, it measures p95 scan latency, storage cost in dollars, "
+            "and write amplification (how many MB compaction rewrites). "
+            "Three independent gradient boosting regressors are then fitted, one per target."
         )
-    with c2:
-        st.markdown("#### The 36-candidate layout search space")
+        st.markdown("**Why three separate models, not one?**")
         st.markdown(
-            "The model scores every combination of 4 file sizes × "
-            "3 compaction triggers × 3 partition strategies."
+            "A layout that cuts latency might blow up write amplification. "
+            "Keeping the targets separate lets the regression guard reason about each independently "
+            "and reject candidates that win on one metric while regressing on another."
         )
-        model, r2, X, y_lat, y_cost, y_wamp = _train_model()
+        st.metric("Held-out latency R²", f"{r2:.3f}",
+                  help="On the 20% of training data the model never saw during fitting")
+        with st.expander("Why is R² 0.977 and not 1.0?"):
+            st.markdown(
+                "Without noise, R² is exactly 1.0 — the model inverts the scan formula "
+                "from the features rather than learning anything general. "
+                "15% Gaussian noise was added to training labels to simulate real measurement "
+                "variance (JIT warmup, GC pauses, S3 tail latency). "
+                "The 0.977 figure reflects genuine generalization, not formula memorization."
+            )
 
+    with col_chart:
         @st.cache_data
-        def _score_all_candidates():
+        def _candidate_scores():
             wf = WorkloadFeatures(
                 ingest_rows_per_sec=9000, avg_selectivity=0.07,
                 time_range_query_ratio=0.9, read_write_ratio=5.0,
@@ -305,130 +238,127 @@ approximate it. A cron job cannot.
                 pred = model.predict(lay, wf)
                 rows.append({
                     "File size (MB)": lay.target_file_mb,
-                    "Compaction trigger": lay.compaction_trigger_files,
-                    "Partition strategy": lay.partition_granularity,
+                    "Partition": lay.partition_granularity,
+                    "Trigger": lay.compaction_trigger_files,
                     "Predicted p95 (ms)": round(pred.p95_latency_ms, 1),
-                    "Objective score": round(pred.objective(), 2),
+                    "Objective": round(pred.objective(), 2),
                 })
             return pd.DataFrame(rows)
 
-        df_cands = _score_all_candidates()
-        fig3 = px.scatter(
-            df_cands,
-            x="File size (MB)",
-            y="Predicted p95 (ms)",
-            color="Partition strategy",
-            size="Compaction trigger",
-            hover_data=["Compaction trigger", "Objective score"],
-            title="Lower = faster. Model ranks all 36 candidates instantly.",
-            color_discrete_sequence=["#4ade80", "#60a5fa", "#f472b6"],
+        df_c = _candidate_scores()
+        COLOR_MAP = {"hour": C_GOOD, "day": C_MODEL, "device_bucket": C_GRAY}
+
+        fig2 = go.Figure()
+        for part in ["hour", "day", "device_bucket"]:
+            sub = df_c[df_c["Partition"] == part]
+            fig2.add_scatter(
+                x=sub["File size (MB)"], y=sub["Predicted p95 (ms)"],
+                mode="markers",
+                marker=dict(
+                    size=sub["Trigger"].map({20: 8, 50: 12, 100: 16}),
+                    color=COLOR_MAP[part],
+                    opacity=0.8,
+                    line=dict(width=1, color="white"),
+                ),
+                name=part,
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b><br>"
+                    "File size: %{x} MB<br>"
+                    "Predicted p95: %{y} ms<br>"
+                    "Trigger: %{customdata[1]} files"
+                    "<extra></extra>"
+                ),
+                customdata=sub[["Partition", "Trigger"]].values,
+            )
+        fig2.update_layout(
+            **CHART_LAYOUT,
+            title=dict(text="All 36 candidates scored — dot size = compaction trigger", font_size=13),
+            xaxis_title="Target file size (MB)",
+            yaxis_title="Predicted p95 latency (ms)",
+            legend=dict(title="Partition strategy", orientation="v"),
         )
-        fig3.update_layout(
-            plot_bgcolor="#0f172a", paper_bgcolor="#0f172a",
-            font_color="#e2e8f0", margin=dict(t=40, b=40),
-        )
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig2, use_container_width=True)
 
     st.divider()
-    st.markdown("### What features the model uses to make predictions")
+    st.subheader("Feature importance — what the model actually learned")
 
     @st.cache_data
-    def _feature_importance():
+    def _importances():
         names = [
-            "target_file_mb", "compaction_trigger", "partition_granularity",
-            "ingest_rows_per_sec", "avg_selectivity", "time_range_query_ratio",
+            "target_file_mb", "compaction_trigger", "partition",
+            "ingest_rows/sec", "avg_selectivity", "time_range_ratio",
             "read_write_ratio", "avg_file_mb", "file_count",
             "small_file_ratio", "partition_count",
         ]
-        importances = model._latency.feature_importances_
-        df = pd.DataFrame({"Feature": names, "Importance": importances})
-        return df.sort_values("Importance", ascending=True)
+        imp = model._latency.feature_importances_
+        return pd.DataFrame({"Feature": names, "Importance": imp}).sort_values("Importance")
 
-    df_imp = _feature_importance()
-    fig4 = px.bar(
-        df_imp, x="Importance", y="Feature", orientation="h",
-        title=f"GBM feature importances — latency head (held-out R² = {r2:.3f})",
-        color="Importance",
-        color_continuous_scale="blues",
+    df_imp = _importances()
+    fig3 = go.Figure()
+    fig3.add_bar(
+        x=df_imp["Importance"], y=df_imp["Feature"],
+        orientation="h",
+        marker_color=[C_MODEL if v > 0.1 else C_GRAY for v in df_imp["Importance"]],
     )
-    fig4.update_layout(
-        plot_bgcolor="#0f172a", paper_bgcolor="#0f172a",
-        font_color="#e2e8f0", showlegend=False,
-        margin=dict(t=40, b=40, l=160),
-        coloraxis_showscale=False,
+    fig3.update_layout(
+        **CHART_LAYOUT,
+        title=dict(text=f"GBM latency head — feature importances  (R² = {r2:.3f})", font_size=13),
+        xaxis_title="Importance",
+        margin=dict(t=36, b=36, l=120, r=8),
     )
-    st.plotly_chart(fig4, use_container_width=True)
-
-    st.markdown(
-        '<div class="callout">'
-        '<b>R² = 0.977</b> on held-out data means the model explains 97.7% of the '
-        'variance in query latency across unseen workloads. The top features — '
-        '<code>avg_file_mb</code> and <code>file_count</code> — directly encode '
-        'the physical scan cost formula. <code>time_range_query_ratio</code> drives '
-        'which partition strategy wins. 15% Gaussian measurement noise was added '
-        'during training to prevent the model from simply memorizing the simulator '
-        'formula (which would give R²=1.0 but generalize to nothing).'
-        '</div>',
-        unsafe_allow_html=True,
-    )
+    st.plotly_chart(fig3, use_container_width=True)
 
 
 # ===========================================================================
-# TAB 3 — LIVE DEMO
+# LIVE DEMO
 # ===========================================================================
 
-with tab3:
-    st.markdown("### Run the optimizer on a simulated table")
+with tab_demo:
+    st.subheader("Run the optimizer on a simulated table")
     st.markdown(
-        "Adjust the workload sliders to describe how this table is being used, "
-        "then click Run. The model will score all 36 layout candidates, shadow-test "
-        "the top 3 on a copy of the table, and apply the one that passes the safety gate."
+        "The table below starts with a bad layout: 64 MB target files with a "
+        "compaction trigger of 100,000 (effectively never compacts). "
+        "Adjust the workload sliders to describe how the table is being queried, "
+        "then run the optimizer."
     )
 
-    model, r2, *_ = _train_model()
+    model, _ = _train_model()
 
-    c_left, c_right = st.columns([1, 1], gap="large")
+    sl, sr = st.columns([1, 2], gap="large")
 
-    with c_left:
-        st.markdown("**Workload settings**")
-        ingest_rps = st.slider(
-            "Ingest rate (rows/second)",
-            min_value=1000, max_value=15000, value=9000, step=500,
-            help="How many telemetry events the pipeline receives per second",
-        )
-        time_range_ratio = st.slider(
-            "Time-range query ratio (0 = full scans, 1 = narrow lookups)",
-            min_value=0.0, max_value=1.0, value=0.9, step=0.05,
-            help="High = queries filter by time window; low = queries scan everything",
-        )
-        selectivity = st.slider(
-            "Average query selectivity (fraction of data read)",
-            min_value=0.01, max_value=0.5, value=0.07, step=0.01,
-            help="0.07 = a query reads 7% of the table on average",
-        )
-        rw_ratio = st.slider(
-            "Read/write ratio",
-            min_value=0.5, max_value=10.0, value=5.0, step=0.5,
-            help="5.0 = for every write, there are 5 reads",
-        )
-
+    with sl:
+        ingest_rps = st.slider("Ingest rate (rows / sec)",
+                               1000, 15000, 9000, 500)
+        time_range = st.slider("Time-range query ratio",
+                               0.0, 1.0, 0.9, 0.05,
+                               help="1.0 = all queries filter by time window")
+        selectivity = st.slider("Avg query selectivity",
+                                0.01, 0.5, 0.07, 0.01,
+                                help="Fraction of the table each query reads")
+        rw_ratio = st.slider("Read / write ratio",
+                             0.5, 10.0, 5.0, 0.5)
         run = st.button("Run optimizer", type="primary", use_container_width=True)
 
-    with c_right:
-        if run:
-            with st.spinner("Building table and running optimizer..."):
-                # Build a badly laid-out table
-                prod = SimulatedIcebergTable(layout=Layout(64, 100000, "device_bucket"))
+    with sr:
+        if not run:
+            st.info(
+                "Adjust the sliders and click **Run optimizer**. "
+                "The model will score all 36 layout candidates, shadow-test the top 3 "
+                "on a copy of the table, and apply the one that passes the safety gate."
+            )
+        else:
+            with st.spinner("Building table and running optimizer…"):
+                prod = SimulatedIcebergTable(layout=Layout(64, 100_000, "device_bucket"))
                 for i in range(300):
                     prod.ingest_micro_batch(mb=0.5, rows=2500, partition=f"b{i % 16}")
 
-                st_before = prod.stats()
-                latency_before = measure_p95_latency(prod)
+                st_before    = prod.stats()
+                lat_before   = measure_p95_latency(prod)
 
                 wf = WorkloadFeatures(
                     ingest_rows_per_sec=float(ingest_rps),
                     avg_selectivity=float(selectivity),
-                    time_range_query_ratio=float(time_range_ratio),
+                    time_range_query_ratio=float(time_range),
                     read_write_ratio=float(rw_ratio),
                     avg_file_mb=st_before.avg_file_mb,
                     file_count=st_before.file_count,
@@ -436,241 +366,175 @@ with tab3:
                     partition_count=st_before.partition_count,
                 )
 
-                # Score all candidates
+                # Score + shadow-test top 8 for the chart
                 rec = recommend(model, prod.layout, wf)
                 ranked_rows = []
                 for i, s in enumerate(rec.ranked[:8]):
-                    shadow = shadow_evaluate(prod, s.layout)
+                    sh = shadow_evaluate(prod, s.layout)
                     ranked_rows.append({
-                        "Rank": i + 1,
-                        "File size": f"{s.layout.target_file_mb} MB",
-                        "Trigger": s.layout.compaction_trigger_files,
-                        "Partition": s.layout.partition_granularity,
-                        "Predicted p95 (ms)": round(s.prediction.p95_latency_ms, 1),
-                        "Shadow p95 (ms)": round(shadow.p95_latency_ms, 1),
+                        "rank": i + 1,
+                        "label": f"{s.layout.target_file_mb}MB / {s.layout.partition_granularity}",
+                        "predicted": round(s.prediction.p95_latency_ms, 1),
+                        "shadow":    round(sh.p95_latency_ms, 1),
                     })
 
-                backend = SimBackend(prod)
                 result = run_once(
-                    model=model, production=prod, backend=backend, wf=wf,
+                    model=model, production=prod,
+                    backend=SimBackend(prod), wf=wf,
                     guard=GuardConfig(min_improvement_pct=5.0),
                     ledger_path="artifacts/demo_ledger.jsonl",
                 )
 
-                st_after = prod.stats()
-                latency_after = measure_p95_latency(prod)
+                st_after  = prod.stats()
+                lat_after = measure_p95_latency(prod)
 
-            # Metrics
-            st.markdown("**Results**")
-            m1, m2 = st.columns(2)
-            pct = (latency_before - latency_after) / latency_before * 100
+            # Key metrics
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("p95 latency — before", f"{lat_before:.0f} ms")
+            m2.metric("p95 latency — after",  f"{lat_after:.0f} ms",
+                      delta=f"{lat_after - lat_before:+.0f} ms", delta_color="inverse")
+            m3.metric("Files — before", st_before.file_count)
+            m4.metric("Files — after",  st_after.file_count,
+                      delta=str(st_after.file_count - st_before.file_count),
+                      delta_color="inverse")
 
-            m1.markdown(
-                f'<div class="metric-card">'
-                f'<div class="metric-value-bad">{latency_before:.0f} ms</div>'
-                f'<div class="metric-label">p95 query latency — before</div>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-            cls = "metric-value-good" if latency_after < latency_before else "metric-value-bad"
-            m2.markdown(
-                f'<div class="metric-card">'
-                f'<div class="{cls}">{latency_after:.0f} ms</div>'
-                f'<div class="metric-label">p95 query latency — after ({pct:+.0f}%)</div>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
+            # Decision
+            if result.promoted:
+                st.success(
+                    f"**Promoted** — {result.reason}  \n"
+                    f"Applied: `{result.proposed}`"
+                )
+            else:
+                st.warning(
+                    f"**No change** — {result.reason}  \n"
+                    f"Best candidate was: `{result.proposed}`"
+                )
 
-            m3, m4 = st.columns(2)
-            m3.markdown(
-                f'<div class="metric-card">'
-                f'<div class="metric-value-bad">{st_before.file_count}</div>'
-                f'<div class="metric-label">Files before</div>'
-                f'</div>',
-                unsafe_allow_html=True,
+            # Candidate comparison chart
+            df_r = pd.DataFrame(ranked_rows)
+            fig4 = go.Figure()
+            fig4.add_bar(
+                x=df_r["label"], y=df_r["predicted"],
+                name="Model prediction", marker_color=C_MODEL,
             )
-            m4.markdown(
-                f'<div class="metric-card">'
-                f'<div class="metric-value-good">{st_after.file_count}</div>'
-                f'<div class="metric-label">Files after</div>'
-                f'</div>',
-                unsafe_allow_html=True,
+            fig4.add_bar(
+                x=df_r["label"], y=df_r["shadow"],
+                name="Shadow measured", marker_color=C_SHADOW,
             )
-
-            promoted_color = "#4ade80" if result.promoted else "#f59e0b"
-            st.markdown(
-                f'<div class="callout" style="border-color: {promoted_color}">'
-                f'<b>Decision:</b> {"PROMOTED" if result.promoted else "NO CHANGE"}<br>'
-                f'<b>Reason:</b> {result.reason}<br>'
-                f'<b>Applied layout:</b> {result.proposed}'
-                f'</div>',
-                unsafe_allow_html=True,
+            fig4.add_hline(
+                y=lat_before, line_dash="dot", line_color=C_BAD, line_width=1.5,
+                annotation_text="Baseline", annotation_position="top right",
             )
-
-            # Candidate ranking chart
-            st.markdown("**Top 8 candidates — predicted vs shadow-measured latency**")
-            df_rank = pd.DataFrame(ranked_rows)
-            fig5 = go.Figure()
-            fig5.add_bar(
-                x=df_rank["Rank"].astype(str),
-                y=df_rank["Predicted p95 (ms)"],
-                name="Model prediction", marker_color="#60a5fa",
-            )
-            fig5.add_bar(
-                x=df_rank["Rank"].astype(str),
-                y=df_rank["Shadow p95 (ms)"],
-                name="Shadow measured", marker_color="#4ade80",
-            )
-            fig5.add_hline(
-                y=latency_before, line_dash="dash", line_color="#f87171",
-                annotation_text="Current baseline",
-            )
-            fig5.update_layout(
+            fig4.update_layout(
+                **CHART_LAYOUT,
                 barmode="group",
-                xaxis_title="Candidate rank (1 = best predicted)",
+                title=dict(text="Top 8 candidates — model prediction vs shadow-measured latency",
+                           font_size=13),
+                xaxis_title="Candidate layout",
                 yaxis_title="p95 latency (ms)",
-                plot_bgcolor="#0f172a", paper_bgcolor="#0f172a",
-                font_color="#e2e8f0",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02),
-                margin=dict(t=40, b=40),
+                legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0),
+                xaxis=dict(tickangle=-25, showgrid=False, linecolor="#e5e7eb"),
             )
-            st.plotly_chart(fig5, use_container_width=True)
-
-        else:
-            st.info("Set the workload sliders and click **Run optimizer** to see it in action.")
+            st.plotly_chart(fig4, use_container_width=True)
 
 
 # ===========================================================================
-# TAB 4 — THE SAFETY NET
+# SAFETY GATE
 # ===========================================================================
 
-with tab4:
-    st.markdown("### The model can be wrong. The safety gate catches that.")
-    st.markdown("""
-The cost model predicts which layout is best, but predictions aren't measurements.
-Before any change touches production, the proposed layout is tested on an exact
-copy of the table. Only if the measured results pass three checks does the
-change get applied.
-    """)
+with tab_guard:
+    st.subheader("Every proposed change is tested on a copy of the table first")
+    st.markdown(
+        "The cost model's prediction gets the optimizer to the right neighborhood, "
+        "but predictions are not measurements. Before any layout change touches production, "
+        "the orchestrator clones the table, applies the change to the clone, benchmarks it, "
+        "and runs three checks. One failure rejects the change."
+    )
 
     st.divider()
-
-    # Step-by-step
-    s1, s2, s3, s4 = st.columns(4)
-    for col, n, title, body in [
-        (s1, "1", "Clone", "Make an exact in-memory copy of the production table. The original is never touched."),
-        (s2, "2", "Apply", "Run compaction on the clone using the proposed layout settings."),
-        (s3, "3", "Measure", "Benchmark the clone: p95 scan latency, storage cost in dollars, write amplification in MB."),
-        (s4, "4", "Guard", "All three metrics must pass their thresholds. One failure rejects the whole change."),
-    ]:
-        col.markdown(
-            f'<div class="metric-card" style="min-height:160px">'
-            f'<span class="step-badge">{n}</span><b>{title}</b><br><br>'
-            f'<span style="font-size:0.85rem; color:#94a3b8">{body}</span>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-
-    st.divider()
-    st.markdown("### The three guard conditions")
 
     g1, g2, g3 = st.columns(3)
-    for col, title, body in [
-        (g1, "Objective must improve by ≥5%",
-         "The weighted sum of latency + cost + write amplification must be at least 5% better than the current layout. A change that is only marginally better is not worth the risk."),
-        (g2, "Latency must not get worse — at all",
-         "A candidate that cuts storage cost by 30% but adds 10ms to p95 latency is rejected outright. Query speed is the primary SLA. No exceptions."),
-        (g3, "Write amplification within tolerance",
-         "Compaction rewrites data. Rewriting 10x more than necessary burns I/O budget and can slow down live ingest. The guard enforces an absolute upper bound."),
-    ]:
-        col.markdown(
-            f'<div class="callout" style="min-height:120px">'
-            f'<b>{title}</b><br><br>'
-            f'<span style="font-size:0.85rem">{body}</span>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
+    g1.markdown("**Clone → Apply → Measure**")
+    g1.markdown(
+        "The production table is deep-copied in memory. Compaction runs on the clone "
+        "using the proposed layout settings. p95 latency, storage cost, and write "
+        "amplification are measured on the result. The production table is read-only "
+        "throughout — it is never touched."
+    )
+    g2.markdown("**Three checks, any failure rejects**")
+    g2.markdown(
+        "The weighted objective (latency + cost + write amplification) must improve "
+        "by at least 5%. Latency must not get worse at all — a layout that cuts cost "
+        "but adds 10 ms to p95 is rejected outright. Write amplification must not "
+        "exceed an absolute tolerance."
+    )
+    g3.markdown("**Everything is logged**")
+    g3.markdown(
+        "Every promotion and every rejection is appended to an audit ledger as JSONL, "
+        "with the full input metrics, the reason string, and a timestamp. "
+        "The system cannot silently make the table worse."
+    )
 
     st.divider()
-    st.markdown("### See a live guard decision")
+    st.subheader("Try the guard yourself")
 
-    model, *_ = _train_model()
-    eg_col1, eg_col2 = st.columns(2)
+    st.markdown(
+        "Enter baseline and candidate metrics below. "
+        "The guard will evaluate the candidate and explain its decision."
+    )
 
-    with eg_col1:
-        st.markdown("**Example 1 — cheaper but slower (rejected)**")
-        base_lat = st.number_input("Baseline p95 latency (ms)", value=200.0, key="b1")
-        cand_lat = st.number_input("Candidate p95 latency (ms)", value=220.0, key="c1",
-                                   help="Candidate is slower — should be rejected")
-        base_cost = st.number_input("Baseline storage cost", value=5.0, key="bc1")
-        cand_cost = st.number_input("Candidate storage cost", value=3.0, key="cc1")
-        if st.button("Check this candidate", key="chk1"):
-            from lakehouse.maintenance.shadow_eval import EvalResult
-            b = EvalResult(layout=Layout(128, 50, "day"),
-                           p95_latency_ms=base_lat, storage_cost=base_cost,
-                           write_amplification=10.0, rows=1000)
-            c = EvalResult(layout=Layout(256, 50, "day"),
-                           p95_latency_ms=cand_lat, storage_cost=cand_cost,
-                           write_amplification=10.0, rows=1000)
-            d = evaluate_promotion(b, c)
-            color = "#4ade80" if d.promote else "#f87171"
-            verdict = "PROMOTED" if d.promote else "REJECTED"
-            st.markdown(
-                f'<div class="callout" style="border-color:{color}">'
-                f'<b>{verdict}</b><br>{d.reason}'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
+    gc1, gc2 = st.columns(2, gap="large")
 
-    with eg_col2:
-        st.markdown("**Example 2 — faster and cheaper (promoted)**")
-        base_lat2 = st.number_input("Baseline p95 latency (ms)", value=200.0, key="b2")
-        cand_lat2 = st.number_input("Candidate p95 latency (ms)", value=120.0, key="c2",
-                                    help="Candidate is faster — should be promoted")
-        base_cost2 = st.number_input("Baseline storage cost", value=5.0, key="bc2")
-        cand_cost2 = st.number_input("Candidate storage cost", value=4.5, key="cc2")
-        if st.button("Check this candidate", key="chk2"):
-            from lakehouse.maintenance.shadow_eval import EvalResult
-            b = EvalResult(layout=Layout(128, 50, "day"),
-                           p95_latency_ms=base_lat2, storage_cost=base_cost2,
-                           write_amplification=10.0, rows=1000)
-            c = EvalResult(layout=Layout(512, 50, "hour"),
-                           p95_latency_ms=cand_lat2, storage_cost=cand_cost2,
-                           write_amplification=10.0, rows=1000)
-            d = evaluate_promotion(b, c)
-            color = "#4ade80" if d.promote else "#f87171"
-            verdict = "PROMOTED" if d.promote else "REJECTED"
-            st.markdown(
-                f'<div class="callout" style="border-color:{color}">'
-                f'<b>{verdict}</b><br>{d.reason}'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
+    with gc1:
+        st.markdown("**Baseline (current table)**")
+        b_lat  = st.number_input("p95 latency (ms)",    value=200.0, key="bl", step=10.0)
+        b_cost = st.number_input("Storage cost ($)",    value=5.0,   key="bc", step=0.5)
+        b_wamp = st.number_input("Write amplification", value=10.0,  key="bw", step=5.0)
+
+    with gc2:
+        st.markdown("**Candidate (proposed layout)**")
+        c_lat  = st.number_input("p95 latency (ms)",    value=120.0, key="cl", step=10.0)
+        c_cost = st.number_input("Storage cost ($)",    value=4.5,   key="cc", step=0.5)
+        c_wamp = st.number_input("Write amplification", value=10.0,  key="cw", step=5.0)
+
+    if st.button("Evaluate candidate", type="primary"):
+        base = EvalResult(layout=Layout(128, 50, "day"),
+                          p95_latency_ms=b_lat, storage_cost=b_cost,
+                          write_amplification=b_wamp, rows=1000)
+        cand = EvalResult(layout=Layout(512, 50, "hour"),
+                          p95_latency_ms=c_lat, storage_cost=c_cost,
+                          write_amplification=c_wamp, rows=1000)
+        d = evaluate_promotion(base, cand)
+
+        if d.promote:
+            st.success(f"**Promoted** — {d.reason}")
+        else:
+            st.error(f"**Rejected** — {d.reason}")
+
+        # Metric deltas
+        dm1, dm2, dm3 = st.columns(3)
+        dm1.metric("Latency change",
+                   f"{c_lat:.0f} ms",
+                   delta=f"{c_lat - b_lat:+.0f} ms", delta_color="inverse")
+        dm2.metric("Storage cost change",
+                   f"${c_cost:.2f}",
+                   delta=f"{c_cost - b_cost:+.2f}", delta_color="inverse")
+        dm3.metric("Write amp change",
+                   f"{c_wamp:.0f}",
+                   delta=f"{c_wamp - b_wamp:+.0f}", delta_color="inverse")
 
     st.divider()
-    st.markdown("### Every decision is logged — nothing is silent")
-    st.markdown("""
-Every promotion and every rejection is written to an append-only JSONL ledger
-with the full input metrics, the outcome, and the reason string. The system can
-never silently make the table worse. If `promotion_ledger.jsonl` exists from a
-previous demo run, it appears below.
-    """)
 
     ledger_path = Path("artifacts/promotion_ledger.jsonl")
     if ledger_path.exists():
         entries = []
-        with open(ledger_path) as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        entries.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        pass
+        for line in ledger_path.read_text().splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
         if entries:
-            df_ledger = pd.DataFrame(entries)
-            st.dataframe(df_ledger, use_container_width=True)
-        else:
-            st.info("Ledger file is empty — run the demo first.")
-    else:
-        st.info("No ledger yet — run the Live Demo tab first.")
+            st.subheader("Promotion ledger")
+            st.dataframe(pd.DataFrame(entries), use_container_width=True, hide_index=True)
