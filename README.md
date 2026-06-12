@@ -32,6 +32,7 @@ Instead, this project learns a cost model: a function from (layout, workload) to
 pip install -r requirements.txt
 make test    # 50 tests, no cluster needed
 make demo    # train the model, stream 300k rows, run one guarded optimization cycle
+make ui      # launch the interactive explainer at http://localhost:8501
 ```
 
 The demo output looks like this:

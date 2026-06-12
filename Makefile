@@ -1,4 +1,4 @@
-.PHONY: help install test demo lint up down seed connect flink-submit stream train
+.PHONY: help install test demo ui lint up down seed connect flink-submit stream train
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -12,6 +12,9 @@ test: ## Run the unit suite (no cluster needed)
 
 demo: ## End-to-end demo on the simulator (no cluster needed)
 	python scripts/run_local_demo.py
+
+ui: ## Launch the interactive explainer UI (http://localhost:8501)
+	PYTHONPATH=src streamlit run ui/app.py
 
 train: ## Train + persist the cost model
 	PYTHONPATH=src python -m lakehouse.optimizer.train --out artifacts/cost_model.joblib
