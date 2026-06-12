@@ -50,6 +50,8 @@ CHART_LAYOUT = dict(
     paper_bgcolor="rgba(0,0,0,0)",
     plot_bgcolor="rgba(0,0,0,0)",
     font=dict(family="Inter, system-ui, sans-serif", size=12),
+)
+_AXIS_DEFAULT = dict(
     margin=dict(t=36, b=36, l=8, r=8),
     xaxis=dict(showgrid=False, linecolor="#e5e7eb"),
     yaxis=dict(gridcolor="#f3f4f6", linecolor="#e5e7eb"),
@@ -153,7 +155,7 @@ with tab_problem:
         fig.add_bar(x=df["Files"], y=df["Data read (ms)"],
                     name="Actual data read", marker_color=C_GRAY)
         fig.update_layout(
-            **CHART_LAYOUT,
+            **CHART_LAYOUT, **_AXIS_DEFAULT,
             barmode="stack",
             title=dict(text="Where query time goes as file count grows", font_size=13),
             xaxis_title="Files on disk",
@@ -271,7 +273,7 @@ with tab_solution:
                 customdata=sub[["Partition", "Trigger"]].values,
             )
         fig2.update_layout(
-            **CHART_LAYOUT,
+            **CHART_LAYOUT, **_AXIS_DEFAULT,
             title=dict(text="All 36 candidates scored — dot size = compaction trigger", font_size=13),
             xaxis_title="Target file size (MB)",
             yaxis_title="Predicted p95 latency (ms)",
@@ -304,6 +306,8 @@ with tab_solution:
         **CHART_LAYOUT,
         title=dict(text=f"GBM latency head — feature importances  (R² = {r2:.3f})", font_size=13),
         xaxis_title="Importance",
+        xaxis=dict(showgrid=False, linecolor="#e5e7eb"),
+        yaxis=dict(gridcolor="#f3f4f6", linecolor="#e5e7eb"),
         margin=dict(t=36, b=36, l=120, r=8),
     )
     st.plotly_chart(fig3, use_container_width=True)
@@ -434,6 +438,8 @@ with tab_demo:
                 yaxis_title="p95 latency (ms)",
                 legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0),
                 xaxis=dict(tickangle=-25, showgrid=False, linecolor="#e5e7eb"),
+                yaxis=dict(gridcolor="#f3f4f6", linecolor="#e5e7eb"),
+                margin=dict(t=36, b=60, l=8, r=8),
             )
             st.plotly_chart(fig4, use_container_width=True)
 
